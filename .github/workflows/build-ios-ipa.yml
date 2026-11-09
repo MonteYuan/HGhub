@@ -1,0 +1,102 @@
+name: Build iOS unsigned IPA
+
+# 手动触发：在仓库 Actions 页选这个工作流，点 Run workflow。
+# 只出 iOS 未签名 IPA，不碰 Windows / Android / macOS 的发布流程。
+on:
+  workflow_dispatch:
+
+jobs:
+  ios:
+    name: iOS (unsigned ipa)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 版本号对齐 tauri.conf.json
+        id: ver
+        shell: bash
+        run: |
+          V="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "version=$V"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: ios
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: 准备 Xcode 环境
+        run: |
+          xcodebuild -version
+          command -v xcodegen >/dev/null || brew install xcodegen
+          # tauri ios build 会检查本机有没有 iOS runtime，没有就要交互确认，CI 下会直接报错
+          if ! xcrun simctl list runtimes | grep -q '^iOS'; then
+            xcodebuild -downloadPlatform iOS
+          fi
+
+      - name: 生成 iOS 工程
+        run: pnpm tauri ios init --ci
+
+      # 没有开发者证书：在工程里关掉签名，archive 照常出 .app，最后一步导出 IPA 会因为没签名失败，
+      # 所以下面直接从 xcarchive 里取 .app 自己打包成 IPA（与 xcodebuild -exportArchive 产物结构一致）。
+      # 做法参考已验证出包的 fork Xiyueyy/HGhub 的 release.yml ios 任务。
+      - name: 关闭代码签名 + 修 Xcode 26 链接路径
+        run: |
+          PBX="$(ls -d src-tauri/gen/apple/*.xcodeproj)/project.pbxproj"
+          perl -0pi -e 's/buildSettings = \{/buildSettings = {\n\t\t\t\tCODE_SIGNING_ALLOWED = NO;\n\t\t\t\tCODE_SIGNING_REQUIRED = NO;/g' "$PBX"
+          grep -c 'CODE_SIGNING_ALLOWED = NO' "$PBX" || true
+          # Xcode 26 的 $(TOOLCHAIN_DIR) 指到 Metal 工具链，链接时找不到 swiftCompatibility56 等库。
+          # tauri 新模板已改成显式的 XcodeDefault 工具链，这里对 2.10 生成的工程打同样的补丁。
+          for f in "$PBX" src-tauri/gen/apple/project.yml; do
+            [ -f "$f" ] && sed -i '' 's#$(TOOLCHAIN_DIR)/usr/lib/swift#$(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift#g' "$f" || true
+          done
+          grep -c 'XcodeDefault.xctoolchain/usr/lib/swift' "$PBX" || true
+
+      # 导出 IPA 那一步会因为没签名失败（预期内），只要 xcarchive 里有 .app 就算成功。
+      - name: 编译并归档
+        run: |
+          pnpm tauri ios build --target aarch64 > build.log 2>&1 || true
+          if ls -d src-tauri/gen/apple/build/*.xcarchive/Products/Applications/*.app >/dev/null 2>&1; then
+            echo "::notice::已归档（导出 IPA 失败属预期，下一步自己打包）"
+            exit 0
+          fi
+          sed -i '' $'s/\x1b\[[0-9;]*m//g' build.log || true
+          { grep -nE '(^|[ :])error(\[E[0-9]+\])?:|\*\* [A-Z ]*FAILED|panicked|^Error|failed to' build.log | head -40
+            echo '----- tail -----'; tail -40 build.log; } | cut -c1-300 > err.txt || true
+          cat err.txt
+          echo "::error title=tauri ios build 失败::$(tr -d '\r' < err.txt | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
+          exit 1
+
+      - name: 打包 IPA
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          APP="$(find src-tauri/gen/apple -maxdepth 6 -type d -path '*.xcarchive/Products/Applications/*.app' | head -1)"
+          if [ -z "$APP" ]; then echo "::error::没有找到 xcarchive 里的 .app，编译失败"; exit 1; fi
+          echo "app: $APP"
+          BIN="$APP/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")"
+          lipo -info "$BIN"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist"
+          mkdir -p ipa/Payload artifacts
+          cp -R "$APP" ipa/Payload/
+          (cd ipa && zip -qry "../artifacts/HGhub_${VERSION}_ios_unsigned.ipa" Payload)
+          ls -lh artifacts
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-unsigned-ipa
+          path: artifacts/*
+          if-no-files-found: error
